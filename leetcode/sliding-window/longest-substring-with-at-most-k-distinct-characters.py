@@ -1,3 +1,36 @@
+def longestSubstringKchars(string, max_char):
+    left, right = 0, 0
+    
+    chars = {}
+    
+    INT_MIN = -int(2 ** 31 + 1)
+    
+    ans = INT_MIN
+    
+    while right < len(string):
+        char = string[right]
+        
+        if char not in chars:
+            chars[char] = 1
+        else:
+            chars[char] += 1
+        
+        while len(chars.keys()) > max_char:
+            char = string[left]
+            
+            chars[char] -= 1
+            
+            if chars[char] == 0:
+                del chars[char]
+                
+            left += 1
+            
+        ans = max(ans, right - left + 1)
+        
+        right += 1
+            
+    return ans
+            
 def sliding_window(string, max_char):
     n = len(string)
     
@@ -32,13 +65,10 @@ def sliding_window(string, max_char):
     return n if width == INT_MIN else width
     
 def test(string, max_char, answer):
-    result = sliding_window(string, max_char)
+    result = longestSubstringKchars(string, max_char)
     
-    if result == answer:
-        print(string, "passed")
-    else:
-        print(string, "failed")
-        
+    print(string, result, "passed" if result == answer else "failed")
+         
 def main():
     test(
         string="ababcbcca",
