@@ -4,8 +4,10 @@
 #include <vector>
 #include <string>
 #include <cmath>
+#include <iomanip> // for output file precision
 #include <cuda_runtime.h>
-#include <iomanip>
+#include <cooperative_groups.h> // CUDA cooperative groups
+#include <cooperative_groups/reduce.h> // CUDA cooperative groups
 
 #define CEIL_DIV(x, y) (x / y + ((x % y) != 0))
 
@@ -170,17 +172,7 @@ __global__ void populateTensorRandomNormalKernel(float* d_out, int nt, float mea
     d_out[idx] = mean + z0 * stddev;
 }
 
-__global__ void populateTensorZeroesKernel(float* d_out, int nt) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (idx >= nt) {
-        return;
-    }
-    
-    d_out[idx] = 0.0f;
-}
-
-void readTrainingData(std::vector<float>& h_Xtrain, std::vector<float>& h_ytrain, const std::string& filename = "mnist_train.csv") {
+void readTrainingData(std::vector<float>& h_Xtrain, std::vector<int>& h_ytrain, const std::string& filename = "mnist_train.csv") {
     std::ifstream file(filename);
     if (!file.is_open()) {
         std::cerr << "Error reading training data from " << filename << ".\n";
@@ -192,7 +184,7 @@ void readTrainingData(std::vector<float>& h_Xtrain, std::vector<float>& h_ytrain
         std::stringstream ss(line);
         std::string c;
         std::getline(ss, c, ','); // read first column; stop at , delimiter
-        float y = std::stof(c);
+        int y = std::stoi(c);
         h_ytrain.push_back(y);
         
         while (std::getline(ss, c, ',')) {
@@ -213,7 +205,7 @@ void test(const std::string testMessage, bool test_cond) {
     }
 }
 
-void getMiniBatchFromHost(std::vector<float>& h_Xtrain, std::vector<float>& h_ytrain, CudaArray<float>& d_Xb, CudaArray<float>& d_yb,
+void getMiniBatchFromHost(std::vector<float>& h_Xtrain, std::vector<int>& h_ytrain, CudaArray<float>& d_Xb, CudaArray<int>& d_yb,
                           int Xrows, int Xcols, int batchSize, int epoch) {
     int batchBegX = (batchSize * Xcols * epoch) % (Xrows * Xcols);
     int batchBegY = (batchSize * epoch) % Xrows;
@@ -221,8 +213,9 @@ void getMiniBatchFromHost(std::vector<float>& h_Xtrain, std::vector<float>& h_yt
     d_yb.copyFromHostArray(h_ytrain.data() + batchBegY, batchSize);
 }
 
-void writeDeviceMatrixToFile(CudaArray<float>& d_out, int rows, int cols, const std::string& filename) {
-    std::vector<float> h_out(d_out.size());
+template <typename T>
+void writeDeviceMatrixToFile(CudaArray<T>& d_out, int rows, int cols, const std::string& filename) {
+    std::vector<T> h_out(d_out.size());
     d_out.copyToHostArray(h_out.data(), h_out.size());
     
     std::ofstream file(filename);
@@ -231,7 +224,7 @@ void writeDeviceMatrixToFile(CudaArray<float>& d_out, int rows, int cols, const 
         exit(-1);
     }
     
-    file << std::fixed << std::setprecision(9);
+    file << std::fixed << std::setprecision(10);
     
     for (int j = 0; j < rows; j++) {
         for (int i = 0; i < cols; i++) {
@@ -246,8 +239,9 @@ void writeDeviceMatrixToFile(CudaArray<float>& d_out, int rows, int cols, const 
     file.close();
 }
 
-void writeDeviceVectorToFile(CudaArray<float>& d_out, int rows, const std::string& filename) {
-    std::vector<float> h_out(d_out.size());
+template <typename T>
+void writeDeviceVectorToFile(CudaArray<T>& d_out, int rows, const std::string& filename) {
+    std::vector<T> h_out(d_out.size());
     d_out.copyToHostArray(h_out.data(), h_out.size());
     
     std::ofstream file(filename);
@@ -256,7 +250,7 @@ void writeDeviceVectorToFile(CudaArray<float>& d_out, int rows, const std::strin
         exit(-1);
     }
     
-    file << std::fixed << std::setprecision(9);
+    file << std::fixed << std::setprecision(10);
     
     for (int j = 0; j < rows; j++) {
         file << h_out[j] << "\n";
@@ -284,7 +278,7 @@ __global__ void matrixMultiplyAddKernel(float* d_out, float* d_inL, float* d_inR
     }
 }
 
-__global__ void tanh_kernel(float* d_out, float* d_in, int nt) {
+__global__ void tanhKernel(float* d_out, float* d_in, int nt) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     
     if (idx >= nt) {
@@ -292,6 +286,77 @@ __global__ void tanh_kernel(float* d_out, float* d_in, int nt) {
     }
     
     d_out[idx] = tanhf(d_in[idx]);
+}
+
+__global__ void softmaxKernel(float* d_probs, float* d_logits, int B, int nHid2) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx >= B) {
+        return;
+    }
+    
+    float* l = d_logits + idx * nHid2;
+    
+    float maxx = -FLT_MAX;
+    for (int i = 0; i < nHid2; i++) {
+        maxx = max(maxx, l[i]);
+    }
+    
+    float sum = 0.0f;
+    for (int i = 0; i < nHid2; i++) {
+        sum += expf(l[i] - maxx);
+    }
+    
+    float* p = d_probs + idx * nHid2;
+    for (int i = 0; i < nHid2; i++) {
+        p[i] = max(1e-8f, expf(l[i] - maxx) / sum);
+    }
+    
+    /*namespace cg = cooperative_groups;
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    // meta_group_size is the number of warps in a block, and meta_group_rank is the warp index
+    int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
+    if(idx >= B) {
+        return;
+    }
+    
+    // the row of input that this group of threads is responsible for
+    const float* l = d_logits + idx * nHid2;
+    
+    // max
+    float maxx = -FLT_MAX;
+    for (int i = warp.thread_rank(); i < nHid2; i += warp.size()) {
+        maxx = max(maxx, l[i]);
+    }
+    maxx = cg::reduce(warp, maxx, cg::greater<float>{});
+    
+    // sum
+    float sum = 0.0f;
+    for (int i = warp.thread_rank(); i < nHid2; i += warp.size()) {
+        sum += expf(l[i] - maxx);
+    }
+    sum = cg::reduce(warp, sum, cg::plus<float>{});
+    
+    // final normalisation
+    float* p = d_probs + idx * nHid2;
+    for (int i = warp.thread_rank(); i < nHid2; i += warp.size()) {
+        p[i] = expf(l[i] - maxx) / sum;
+    }*/
+}
+
+__global__ void crossEntropyKernel(float* d_losses, float* d_probs, int* d_yb, int B, int nHid2) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx >= B) {
+        return;
+    }
+    
+    float* p = d_probs + idx * nHid2;
+    
+    int col = d_yb[idx];
+    
+    d_losses[idx] = -logf(p[col]);
 }
 
 int main(int argc, char** argv) {
@@ -302,11 +367,11 @@ int main(int argc, char** argv) {
     constexpr int Xcols = 784;
     constexpr int batchSize = 2000;
     constexpr int B = batchSize;
-    constexpr int n_hid1 = 100;
-    constexpr int n_hid2 = 10;
+    constexpr int nHid1 = 100;
+    constexpr int nHid2 = 10;
     
     std::vector<float> h_Xtrain;
-    std::vector<float> h_ytrain;
+    std::vector<int>   h_ytrain;
     
     readTrainingData(h_Xtrain, h_ytrain);
     
@@ -315,14 +380,16 @@ int main(int argc, char** argv) {
     
     // parameter and layer tensors
     CudaArray<float> d_Xb(B * Xcols);
-    CudaArray<float> d_yb(B);
-    CudaArray<float> d_W1(Xcols * n_hid1);
-    CudaArray<float> d_b1(n_hid1);
-    CudaArray<float> d_lin(B * n_hid1);
-    CudaArray<float> d_act(B * n_hid1);
-    CudaArray<float> d_W2(n_hid1 * n_hid2);
-    CudaArray<float> d_b2(n_hid2);
-    CudaArray<float> d_logits(B * n_hid2);
+    CudaArray<int>   d_yb(B);
+    CudaArray<float> d_W1(Xcols * nHid1);
+    CudaArray<float> d_b1(nHid1);
+    CudaArray<float> d_lin(B * nHid1);
+    CudaArray<float> d_act(B * nHid1);
+    CudaArray<float> d_W2(nHid1 * nHid2);
+    CudaArray<float> d_b2(nHid2);
+    CudaArray<float> d_logits(B * nHid2);
+    CudaArray<float> d_probs(B * nHid2);
+    CudaArray<float> d_losses(B);
     
     // populating tensors
     int blockSize = 256;
@@ -337,26 +404,34 @@ int main(int argc, char** argv) {
     populateTensorRandomNormalKernel<<<CEIL_DIV(d_b2.size(), blockSize), blockSize>>>(d_b2.data(), d_b2.size(), mean, stddev, seed);
     
     // layer tensors can just be zero initialised
-    populateTensorZeroesKernel<<<CEIL_DIV(d_Xb.size(),     blockSize), blockSize>>>(d_Xb.data(),     d_Xb.size());
-    populateTensorZeroesKernel<<<CEIL_DIV(d_yb.size(),     blockSize), blockSize>>>(d_yb.data(),     d_yb.size());
-    populateTensorZeroesKernel<<<CEIL_DIV(d_lin.size(),    blockSize), blockSize>>>(d_lin.data(),    d_lin.size());
-    populateTensorZeroesKernel<<<CEIL_DIV(d_act.size(),    blockSize), blockSize>>>(d_act.data(),    d_act.size());
-    populateTensorZeroesKernel<<<CEIL_DIV(d_logits.size(), blockSize), blockSize>>>(d_logits.data(), d_logits.size());
+    cudaMemset(d_Xb.data(),     0, d_Xb.size());
+    cudaMemset(d_yb.data(),     0, d_yb.size());
+    cudaMemset(d_lin.data(),    0, d_lin.size());
+    cudaMemset(d_act.data(),    0, d_act.size());
+    cudaMemset(d_logits.data(), 0, d_logits.size());
+    cudaMemset(d_probs.data(),  0, d_probs.size());
     
+    // forward
     getMiniBatchFromHost(h_Xtrain, h_ytrain, d_Xb, d_yb, Xrows, Xcols, batchSize, 1);
-    
-    //__global__ void matrixMultiplyAddKernel(float* d_out, float* d_inL, float* d_inR, float* d_b, int rowsL, int K, int colsR)
-    matrixMultiplyAddKernel<<<CEIL_DIV(d_lin.size(), blockSize), blockSize>>>(d_lin.data(), d_Xb.data(), d_W1.data(), d_b1.data(), B, Xcols, n_hid1);
-    
-    writeDeviceMatrixToFile(d_Xb, batchSize, Xcols, "Xb.csv");
-    writeDeviceVectorToFile(d_yb, batchSize, "yb.csv");
-    writeDeviceMatrixToFile(d_W1, Xcols, n_hid1, "W1.csv");
-    writeDeviceVectorToFile(d_b1, n_hid1, "b1.csv");
-    writeDeviceMatrixToFile(d_lin, B, n_hid1, "lin.csv");
-    
-    tanh_kernel<<<CEIL_DIV(d_act.size(), blockSize), blockSize>>>(d_act.data(), d_lin.data(), d_act.size());
-    
-    writeDeviceMatrixToFile(d_act, B, n_hid1, "act.csv");
+    matrixMultiplyAddKernel<<<CEIL_DIV(d_lin.size(), blockSize), blockSize>>>(d_lin.data(), d_Xb.data(), d_W1.data(), d_b1.data(), B, Xcols, nHid1);
+    tanhKernel<<<CEIL_DIV(d_act.size(), blockSize), blockSize>>>(d_act.data(), d_lin.data(), d_act.size());
+    matrixMultiplyAddKernel<<<CEIL_DIV(d_logits.size(), blockSize), blockSize>>>(d_logits.data(), d_act.data(), d_W2.data(), d_b2.data(), B, nHid1, nHid2);
+    softmaxKernel<<<CEIL_DIV(B, blockSize), blockSize>>>(d_probs.data(), d_logits.data(), B, nHid2);
+    crossEntropyKernel<<<CEIL_DIV(B, blockSize), blockSize>>>(d_losses.data(), d_probs.data(), d_yb.data(), B, nHid2);
     
     CHECK_CUDA_ERROR(cudaPeekAtLastError())
+    
+    // writing data for testing against pytorch
+    writeDeviceMatrixToFile<float>(d_Xb, batchSize, Xcols, "Xb.csv");
+    writeDeviceVectorToFile<int>  (d_yb, batchSize, "yb.csv");
+    writeDeviceMatrixToFile<float>(d_W1, Xcols, nHid1, "W1.csv");
+    writeDeviceVectorToFile<float>(d_b1, nHid1, "b1.csv");
+    writeDeviceMatrixToFile<float>(d_lin, B, nHid1, "lin.csv");
+    writeDeviceMatrixToFile<float>(d_act, B, nHid1, "act.csv");
+    writeDeviceMatrixToFile<float>(d_W2, nHid1, nHid2, "W2.csv");
+    writeDeviceVectorToFile<float>(d_b2, nHid2, "b2.csv");
+    writeDeviceMatrixToFile<float>(d_logits, B, nHid2, "logits.csv");
+    writeDeviceMatrixToFile<float>(d_probs, B, nHid2, "probs.csv");
+    writeDeviceVectorToFile<float>(d_losses, B, "losses.csv");
+    
 }

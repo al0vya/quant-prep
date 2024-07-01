@@ -1,13 +1,34 @@
 import os
 import torch
+import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
 
+# doing computations on the GPU is VERY important to make sure PyTorch/CUDA comparisons match, otherwise they will not
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
 def main():
-    test_minibatch_loading()
-    test_params_distribution()
-    test_matmul()
+    #test_minibatch_loading()
+    #test_params_distribution()
+    #test_matmul1()
+    #test_matmul2()
+    #test_tanh()
+    #test_softmax()
+    test_cross_entropy()
     
+def compare(operation, t, pt, n = 100):
+    maxdiff = (t - pt).abs().max().item()
+    
+    if torch.allclose(t, pt):
+        print(f'{operation} is close, maxdiff: {maxdiff}')
+    else:
+        print(f'{operation} failed, maxdiff: {maxdiff}')
+        
+    if t.ndim == 2:
+        plt.imshow((t - pt)[:n].tolist())
+        plt.title(f'{operation} differences')
+        plt.show()
+
 def test_minibatch_loading():
     Xb = np.loadtxt('Xb.csv', delimiter=',', dtype=np.float32)
     yb = np.loadtxt('yb.csv', delimiter=',', dtype=np.float32)
@@ -50,25 +71,41 @@ def test_params_distribution():
     fig.tight_layout()
     plt.show()
     
-def test_matmul():
-    # doing computations on the GPU is very important to make sure PyTorch/CUDA comparisons match, otherwise they will not
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    Xb  = torch.from_numpy(np.loadtxt('Xb.csv',  delimiter=',', dtype=np.float32)).to(device)
-    W1  = torch.from_numpy(np.loadtxt('W1.csv',  delimiter=',', dtype=np.float32)).to(device)
-    b1  = torch.from_numpy(np.loadtxt('b1.csv',  delimiter=',', dtype=np.float32)).to(device).view((1,100))
+def test_matmul1():
+    Xb = torch.from_numpy(np.loadtxt('Xb.csv', delimiter=',', dtype=np.float32)).to(device)
+    W1 = torch.from_numpy(np.loadtxt('W1.csv', delimiter=',', dtype=np.float32)).to(device)
+    b1 = torch.from_numpy(np.loadtxt('b1.csv', delimiter=',', dtype=np.float32)).to(device).view((1,W1.shape[1]))
     lin = torch.from_numpy(np.loadtxt('lin.csv', delimiter=',', dtype=np.float32)).to(device)
+    lin_t = Xb @ W1 + b1
+    compare('matmul1', lin, lin_t)
     
-    lin_torch = Xb @ W1 + b1
+def test_matmul2():
+    act = torch.from_numpy(np.loadtxt('act.csv', delimiter=',', dtype=np.float32)).to(device)
+    W2 = torch.from_numpy(np.loadtxt('W2.csv', delimiter=',', dtype=np.float32)).to(device)
+    b2 = torch.from_numpy(np.loadtxt('b2.csv', delimiter=',', dtype=np.float32)).to(device).view((1,W2.shape[1]))
+    logits = torch.from_numpy(np.loadtxt('logits.csv', delimiter=',', dtype=np.float32)).to(device)
+    logits_t = act @ W2 + b2
+    compare('matmul2', logits, logits_t)
     
-    maxdiff = (lin - lin_torch).abs().max().item()
+def test_tanh():
+    lin = torch.from_numpy(np.loadtxt('lin.csv', delimiter=',', dtype=np.float32)).to(device)
+    act = torch.from_numpy(np.loadtxt('act.csv', delimiter=',', dtype=np.float32)).to(device)
+    act_t = torch.tanh(lin)
+    compare('tanh', act, act_t)
+
+def test_softmax():
+    logits = torch.from_numpy(np.loadtxt('logits.csv', delimiter=',', dtype=np.float32)).to(device)
+    probs = torch.from_numpy(np.loadtxt('probs.csv', delimiter=',', dtype=np.float32)).to(device)
+    probs_t = F.softmax(logits, dim=1)
+    compare('softmax', probs, probs_t)
     
-    if torch.allclose(lin, lin_torch):
-        print(f'Matmul is close, maxdiff: {maxdiff}')
-    else:
-        print(f'Matmul failed, maxdiff: {maxdiff}')
-    
-    plt.imshow((lin - lin_torch)[:100].tolist())
-    plt.show()
+def test_cross_entropy():
+    yb = torch.from_numpy(np.loadtxt('yb.csv', delimiter=',', dtype=np.int64)).to(device)
+    probs = torch.from_numpy(np.loadtxt('probs.csv', delimiter=',', dtype=np.float32)).to(device)
+    losses = torch.from_numpy(np.loadtxt('losses.csv', delimiter=',', dtype=np.float32)).to(device)
+    losses_t = -probs[range(yb.shape[0]), yb].log()
+    np.savetxt('losses_t.csv', losses_t.view(-1).cpu().numpy(), delimiter=',')
+    compare('cross entropy', losses, losses_t)
     
 if __name__ == '__main__':
     main()
