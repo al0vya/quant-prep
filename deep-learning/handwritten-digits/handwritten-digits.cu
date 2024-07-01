@@ -6,6 +6,7 @@
 #include <vector>
 #include <string>
 #include <cmath>
+#include <random>
 #include <iomanip> // for output file precision
 #include <cuda_runtime.h>
 #include <cooperative_groups.h> // CUDA cooperative groups
@@ -116,7 +117,7 @@ __global__ void test_kernel(float* d_in, float* d_out, int nt) {
 }
 
 bool testCudaArray() {
-    constexpr int NUM_ELEMS = 1 << 20; // 2^20 
+    const int NUM_ELEMS = 1 << 20; // 2^20 
     std::vector<float> h_in(NUM_ELEMS);
     std::vector<float> h_out(NUM_ELEMS, 0.0f);
     
@@ -127,9 +128,9 @@ bool testCudaArray() {
     CudaArray<float> d_in(h_in.data(), h_in.size());
     CudaArray<float> d_out(h_out.data(), h_out.size());
     
-    constexpr int blockSize = 256;
-    constexpr int numBlocks = NUM_ELEMS / blockSize; // powers of 2 always divisible
-    constexpr int numThreads = NUM_ELEMS;
+    const int blockSize = 256;
+    const int numBlocks = NUM_ELEMS / blockSize; // powers of 2 always divisible
+    const int numThreads = NUM_ELEMS;
     
     test_kernel<<<numBlocks, blockSize>>>(d_in.data(), d_out.data(), numThreads);
     
@@ -210,10 +211,10 @@ void test(const std::string testMessage, bool test_cond) {
 
 void getMiniBatchFromHost(std::vector<float>& h_Xtrain, std::vector<int>& h_ytrain, CudaArray<float>& d_Xb, CudaArray<int>& d_yb,
                           int Xrows, int Xcols, int batchSize, int epoch) {
-    int batchBegX = (batchSize * Xcols * epoch) % (Xrows * Xcols);
-    int batchBegY = (batchSize * epoch) % Xrows;
-    d_Xb.copyFromHostArray(h_Xtrain.data() + batchBegX, batchSize * Xcols);
+    int batchBegY = (batchSize * epoch) % Xrows; // row
+    int batchBegX = batchBegY * Xcols;
     d_yb.copyFromHostArray(h_ytrain.data() + batchBegY, batchSize);
+    d_Xb.copyFromHostArray(h_Xtrain.data() + batchBegX, batchSize * Xcols);
 }
 
 template <typename T>
@@ -224,7 +225,7 @@ void writeDeviceMatrixToFile(CudaArray<T>& d_out, int rows, int cols, const std:
     std::ofstream file(filename);
     if (!file.is_open()) {
         std::cerr << "Error: failed to open file " << filename << " for writing device matrix to file.\n";
-        exit(-1);
+        std::exit(EXIT_FAILURE);
     }
     
     file << std::fixed << std::setprecision(10);
@@ -250,7 +251,24 @@ void writeDeviceVectorToFile(CudaArray<T>& d_out, int rows, const std::string& f
     std::ofstream file(filename);
     if (!file.is_open()) {
         std::cerr << "Error: failed to open file " << filename << " for writing device vector to file.\n";
-        exit(-1);
+        std::exit(EXIT_FAILURE);
+    }
+    
+    file << std::fixed << std::setprecision(10);
+    
+    for (int j = 0; j < rows; j++) {
+        file << h_out[j] << "\n";
+    }
+    
+    file.close();
+}
+
+template <typename T>
+void writeHostVectorToFile(std::vector<T> h_out, int rows, const std::string& filename) {
+    std::ofstream file(filename);
+    if (!file.is_open()) {
+        std::cerr << "Error: failed to open file " << filename << " for writing host vector to file.\n";
+        std::exit(EXIT_FAILURE);
     }
     
     file << std::fixed << std::setprecision(10);
@@ -382,7 +400,7 @@ __global__ void biasBackwardKernel(float* dbias, const float* dout, int rows, in
         return;
     }
     
-    col = dout + col;
+    const float* dout_col = dout + col;
     
     float dout_sum = 0.0f;
     for (int row = warp_id; row < rows; row += vstep) {
@@ -420,16 +438,58 @@ __global__ void parameterUpdateKernel(float* d_params, float* d_grads, float lr,
     d_params[idx] -= lr * d_grads[idx];
 }
 
+template <typename T>
+T readParam(const std::string& paramName, const std::string& filename = "params.txt") {
+    std::ifstream file(filename);
+    if (!file.is_open()) {
+        std::cerr << "Error opening " << filename << " for reading in hyperparameters.\n";
+        std::exit(EXIT_FAILURE);
+    }
+    
+    std::string line;
+    while (std::getline(file, line)) {
+        std::istringstream ss(line);
+        std::string name;
+        T value;
+        
+        if (ss >> name >> value) {
+            if (name == paramName) {
+                return value;
+            }
+        }
+    }
+    
+    std::cerr << "Error: hyperparameter " << paramName << " not found in " << filename << ".\n";
+    std::exit(EXIT_FAILURE);
+}
+
+template <typename T>
+std::vector<T> generateStandardNormalRandomVector(size_t N, int seed) {
+    std::mt19937 g(seed); // generator
+    std::normal_distribution<T> dis(0.0, 1.0);
+    std::vector<T> randomVec(N);
+    
+    for (int i = 0; i < N; i++) {
+        randomVec[i] = dis(g);
+    }
+
+    return randomVec;
+}
+
 int main(int argc, char** argv) {
     test("correctly initialising a CudaArray and then populating it with a kernel", testCudaArray());
     
-    // tensor sizes
-    constexpr int Xrows = 60000;
-    constexpr int Xcols = 784;
-    constexpr int batchSize = 2000;
-    constexpr int B = batchSize;
-    constexpr int nHid1 = 100;
-    constexpr int nHid2 = 10;
+    // tensor sizes and hyperparameters
+    const int Xrows = 60000;
+    const int Xcols = 784;
+    const int batchSize = readParam<float>("batchSize");
+    const int B = batchSize;
+    const int nHid1 = 100;
+    const int nHid2 = 10;
+    bool testing = readParam<bool>("testing");
+    const float lr = readParam<float>("lr");
+    int epochs = readParam<int>("epochs");
+    std::vector<float> losses(epochs);
     
     std::vector<float> h_Xtrain;
     std::vector<int>   h_ytrain;
@@ -470,19 +530,20 @@ int main(int argc, char** argv) {
     
     // populating tensors
     int blockSize = 256;
-    float mean = 0.0f;
-    float stddev = 1.0f;
     int seed = 21431;
     
-    // parameter tensors are initialised as random normal
-    populateTensorRandomNormalKernel<<<CEIL_DIV(d_W1.size(), blockSize), blockSize>>>(d_W1.data(), d_W1.size(), mean, stddev, seed);
-    populateTensorRandomNormalKernel<<<CEIL_DIV(d_b1.size(), blockSize), blockSize>>>(d_b1.data(), d_b1.size(), mean, stddev, seed);
-    populateTensorRandomNormalKernel<<<CEIL_DIV(d_W2.size(), blockSize), blockSize>>>(d_W2.data(), d_W2.size(), mean, stddev, seed);
-    populateTensorRandomNormalKernel<<<CEIL_DIV(d_b2.size(), blockSize), blockSize>>>(d_b2.data(), d_b2.size(), mean, stddev, seed);
+    // weight tensors are initialised as random normal
+    std::vector<float> rVec1 = generateStandardNormalRandomVector<float>(d_W1.size(), seed);
+    std::vector<float> rVec2 = generateStandardNormalRandomVector<float>(d_W2.size(), seed);
+    d_W1.copyFromHostArray(rVec1.data(), rVec1.size());
+    d_W2.copyFromHostArray(rVec2.data(), rVec2.size());
     
-    // layer and gradient tensors can just be zero initialised
+    
+    // biases, layer and gradient tensors can just be zero initialised
     cudaMemset(d_Xb.data(),      0, d_Xb.size());
     cudaMemset(d_yb.data(),      0, d_yb.size());
+    cudaMemset(d_b1.data(),      0, d_b1.size());
+    cudaMemset(d_b2.data(),      0, d_b2.size());
     cudaMemset(d_lin.data(),     0, d_lin.size());
     cudaMemset(d_act.data(),     0, d_act.size());
     cudaMemset(d_logits.data(),  0, d_logits.size());
@@ -498,10 +559,6 @@ int main(int argc, char** argv) {
     cudaMemset(d_W2T.data(),     0, d_W2T.size());
     cudaMemset(d_actT.data(),    0, d_actT.size());
     
-    bool testing = true;
-    const float lr = 0.1f;
-    int epochs = 1000;
-    
     for (int e = 0; e < epochs; e++) {
         // forward
         getMiniBatchFromHost(h_Xtrain, h_ytrain, d_Xb, d_yb, Xrows, Xcols, batchSize, e);
@@ -511,7 +568,7 @@ int main(int argc, char** argv) {
         softmaxKernel<<<CEIL_DIV(B, blockSize), blockSize>>>(d_probs.data(), d_logits.data(), B, nHid2);
         crossEntropyKernel<<<CEIL_DIV(B, blockSize), blockSize>>>(d_losses.data(), d_probs.data(), d_yb.data(), B, nHid2);
         float loss = getMeanFromArray<float>(d_losses.data(), d_losses.size());
-        std::cout << "Loss (CUDA): " << loss << "\n";
+        losses[e] = loss;
         
         // backward
         softmaxKernel<<<CEIL_DIV(B, blockSize), blockSize>>>(d_dlogits.data(), d_logits.data(), B, nHid2, true);
@@ -557,4 +614,9 @@ int main(int argc, char** argv) {
         parameterUpdateKernel<<<CEIL_DIV(d_W2.size(), blockSize), blockSize>>>(d_W2.data(), d_dW2.data(), lr, d_W2.size());
         parameterUpdateKernel<<<CEIL_DIV(d_b2.size(), blockSize), blockSize>>>(d_b2.data(), d_db2.data(), lr, d_b2.size());
     }
+    
+    std::cout << "Finished training.\n";
+    
+    writeHostVectorToFile(losses, losses.size(), "training-losses.csv");
+    
 }

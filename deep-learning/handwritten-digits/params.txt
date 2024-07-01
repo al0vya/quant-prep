@@ -1,0 +1,4 @@
+testing 1
+lr 0.1
+epochs 4000
+batchSize 2000

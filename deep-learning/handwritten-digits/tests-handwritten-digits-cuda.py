@@ -3,13 +3,14 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
+import pandas as pd
 
 # doing computations on the GPU is VERY important to make sure PyTorch/CUDA comparisons match, otherwise they will not
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 def main():
-    #test_minibatch_loading()
-    #test_params_distribution()
+    test_minibatch_loading()
+    test_params_distribution()
     test_matmul1()
     test_tanh()
     test_matmul2()
@@ -23,6 +24,7 @@ def main():
     test_tanh_backward()
     test_W1_backward()
     test_b1_backward()
+    plot_loss_metrics()
     
 def compare(operation, t, pt, n = 100):
     maxerr = (t - pt).abs().max().item()
@@ -169,5 +171,10 @@ def test_b1_backward():
     db1_t = dlin.sum(dim=0, keepdims=True)
     compare('b1 backward', db1, db1_t)
     
+def plot_loss_metrics():
+    df = pd.read_csv('training-losses.csv', header=None)
+    df.plot()
+    plt.show()
+
 if __name__ == '__main__':
     main()
