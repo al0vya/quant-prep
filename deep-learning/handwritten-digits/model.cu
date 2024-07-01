@@ -1,4 +1,4 @@
-// compile with: nvcc handwritten-digits.cu -O2 -o handwritten-digits.exe
+// compile with: nvcc model.cu -O2 -o model.exe
 
 #include <iostream>
 #include <fstream>
@@ -13,10 +13,11 @@
 #include <cooperative_groups/reduce.h>
 #include <cub/cub.cuh>
 
+// Macros
 #define CEIL_DIV(x, y) (x / y + ((x % y) != 0))
-
 #define CHECK_CUDA_ERROR(ans) { cudaAssert((ans), __FILE__, __LINE__); }
 
+// CUDA error handling
 void cudaAssert(cudaError_t errorCode, const char* file, const int line) {
     if (errorCode != cudaSuccess) {
         std::cerr << "CUDA error: " << cudaGetErrorString(errorCode) << " " << file << " " << line << "\n";
@@ -24,6 +25,7 @@ void cudaAssert(cudaError_t errorCode, const char* file, const int line) {
     }
 }
 
+// Classes
 template <typename T>
 class CudaArray {
     public:
@@ -82,7 +84,7 @@ class CudaArray {
         void copyFromHostArray(T* data, size_t size) {
             if (m_size < size) {
                 std::cerr << "Error: tried to copy from a host array that is larger than the device array.\n";
-                exit(1);
+                std::exit(EXIT_FAILURE);
             }
             
             CHECK_CUDA_ERROR(cudaMemcpy(m_data, data, size * sizeof(T), cudaMemcpyHostToDevice));
@@ -91,7 +93,7 @@ class CudaArray {
         void copyToHostArray(T* data, size_t size) {
             if (m_size > size) {
                 std::cerr << "Error: tried to copy to a host array that is smaller than the device array.\n";
-                exit(1);
+                std::exit(EXIT_FAILURE);
             }
             
             CHECK_CUDA_ERROR(cudaMemcpy(data, m_data, m_size * sizeof(T), cudaMemcpyDeviceToHost));
@@ -102,10 +104,74 @@ class CudaArray {
         T* m_data;
 };
 
+// Utilities
 bool are_floats_equal(float a, float b, float epsilon = 1e-6f) {
     return std::abs(a - b) <= epsilon;
 }
 
+void getMiniBatchFromHost(std::vector<float>& h_Xtrain, std::vector<int>& h_ytrain, CudaArray<float>& d_Xb, CudaArray<int>& d_yb,
+                          int Xrows, int Xcols, int batchSize, int epoch) {
+    int batchBegY = (batchSize * epoch) % Xrows; // row
+    int batchBegX = batchBegY * Xcols;
+    d_yb.copyFromHostArray(h_ytrain.data() + batchBegY, batchSize);
+    d_Xb.copyFromHostArray(h_Xtrain.data() + batchBegX, batchSize * Xcols);
+}
+
+template <typename T>
+T getMeanFromArray(T* d_in, size_t size) {
+    std::vector<T> hSumOut(1);
+    CudaArray<T>   dSumOut(1);
+    
+    // first call to get temporary storage
+    void* tempStorage = nullptr;
+    size_t tempStorageBytes = 0;
+    CHECK_CUDA_ERROR(cub::DeviceReduce::Sum(tempStorage, tempStorageBytes, d_in, dSumOut.data(), size));
+    CHECK_CUDA_ERROR(cudaMalloc(&tempStorage, tempStorageBytes));
+    CHECK_CUDA_ERROR(cub::DeviceReduce::Sum(tempStorage, tempStorageBytes, d_in, dSumOut.data(), size));
+    dSumOut.copyToHostArray(hSumOut.data(), hSumOut.size());
+    
+    return hSumOut.data()[0] / static_cast<T>(size);
+}
+
+template <typename T>
+T readParam(const std::string& paramName, const std::string& filename = "params.txt") {
+    std::ifstream file(filename);
+    if (!file.is_open()) {
+        std::cerr << "Error opening " << filename << " for reading in hyperparameters.\n";
+        std::exit(EXIT_FAILURE);
+    }
+    
+    std::string line;
+    while (std::getline(file, line)) {
+        std::istringstream ss(line);
+        std::string name;
+        T value;
+        
+        if (ss >> name >> value) {
+            if (name == paramName) {
+                return value;
+            }
+        }
+    }
+    
+    std::cerr << "Error: hyperparameter " << paramName << " not found in " << filename << ".\n";
+    std::exit(EXIT_FAILURE);
+}
+
+template <typename T>
+std::vector<T> generateStandardNormalRandomVector(size_t N, int seed) {
+    std::mt19937 g(seed); // generator
+    std::normal_distribution<T> dis(0.0, 1.0);
+    std::vector<T> randomVec(N);
+    
+    for (int i = 0; i < N; i++) {
+        randomVec[i] = dis(g);
+    }
+
+    return randomVec;
+}
+
+// Kernels
 __global__ void test_kernel(float* d_in, float* d_out, int nt) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     
@@ -114,35 +180,6 @@ __global__ void test_kernel(float* d_in, float* d_out, int nt) {
     }
     
     d_out[idx] = d_in[idx];
-}
-
-bool testCudaArray() {
-    const int NUM_ELEMS = 1 << 20; // 2^20 
-    std::vector<float> h_in(NUM_ELEMS);
-    std::vector<float> h_out(NUM_ELEMS, 0.0f);
-    
-    for (int i = 0; i < NUM_ELEMS; i++) {
-        h_in[i] = static_cast<float>(i);
-    }
-    
-    CudaArray<float> d_in(h_in.data(), h_in.size());
-    CudaArray<float> d_out(h_out.data(), h_out.size());
-    
-    const int blockSize = 256;
-    const int numBlocks = NUM_ELEMS / blockSize; // powers of 2 always divisible
-    const int numThreads = NUM_ELEMS;
-    
-    test_kernel<<<numBlocks, blockSize>>>(d_in.data(), d_out.data(), numThreads);
-    
-    d_out.copyToHostArray(h_out.data(), h_out.size());
-    
-    for (int i = 0; i < h_in.size(); i++) {
-        if (!are_floats_equal(h_in[i], h_out[i])) {
-            return false;
-        }
-    }
-    
-    return true;
 }
 
 // linear congruential generator
@@ -174,110 +211,6 @@ __global__ void populateTensorRandomNormalKernel(float* d_out, int nt, float mea
     float z0 = r * cosf(theta);
 
     d_out[idx] = mean + z0 * stddev;
-}
-
-void readTrainingData(std::vector<float>& h_Xtrain, std::vector<int>& h_ytrain, const std::string& filename = "mnist_train.csv") {
-    std::ifstream file(filename);
-    if (!file.is_open()) {
-        std::cerr << "Error reading training data from " << filename << ".\n";
-        exit(1);
-    }
-    
-    std::string line;
-    while (std::getline(file, line)) {
-        std::stringstream ss(line);
-        std::string c;
-        std::getline(ss, c, ','); // read first column; stop at , delimiter
-        int y = std::stoi(c);
-        h_ytrain.push_back(y);
-        
-        while (std::getline(ss, c, ',')) {
-            float x = std::stof(c);
-            h_Xtrain.push_back(x);
-        }
-    }
-    
-    file.close();
-}
-
-void test(const std::string testMessage, bool test_cond) {
-    if (test_cond) {
-        std::cout << "Succeeded in " << testMessage << ".\n";
-    } else {
-        std::cout << "Failed in " << testMessage << ".\n";
-        exit(1);
-    }
-}
-
-void getMiniBatchFromHost(std::vector<float>& h_Xtrain, std::vector<int>& h_ytrain, CudaArray<float>& d_Xb, CudaArray<int>& d_yb,
-                          int Xrows, int Xcols, int batchSize, int epoch) {
-    int batchBegY = (batchSize * epoch) % Xrows; // row
-    int batchBegX = batchBegY * Xcols;
-    d_yb.copyFromHostArray(h_ytrain.data() + batchBegY, batchSize);
-    d_Xb.copyFromHostArray(h_Xtrain.data() + batchBegX, batchSize * Xcols);
-}
-
-template <typename T>
-void writeDeviceMatrixToFile(CudaArray<T>& d_out, int rows, int cols, const std::string& filename) {
-    std::vector<T> h_out(d_out.size());
-    d_out.copyToHostArray(h_out.data(), h_out.size());
-    
-    std::ofstream file(filename);
-    if (!file.is_open()) {
-        std::cerr << "Error: failed to open file " << filename << " for writing device matrix to file.\n";
-        std::exit(EXIT_FAILURE);
-    }
-    
-    file << std::fixed << std::setprecision(10);
-    
-    for (int j = 0; j < rows; j++) {
-        for (int i = 0; i < cols; i++) {
-            file << h_out[j * cols + i];
-            if (i < cols - 1) {
-                file << ",";
-            }
-        }
-        file << "\n";
-    }
-    
-    file.close();
-}
-
-template <typename T>
-void writeDeviceVectorToFile(CudaArray<T>& d_out, int rows, const std::string& filename) {
-    std::vector<T> h_out(d_out.size());
-    d_out.copyToHostArray(h_out.data(), h_out.size());
-    
-    std::ofstream file(filename);
-    if (!file.is_open()) {
-        std::cerr << "Error: failed to open file " << filename << " for writing device vector to file.\n";
-        std::exit(EXIT_FAILURE);
-    }
-    
-    file << std::fixed << std::setprecision(10);
-    
-    for (int j = 0; j < rows; j++) {
-        file << h_out[j] << "\n";
-    }
-    
-    file.close();
-}
-
-template <typename T>
-void writeHostVectorToFile(std::vector<T> h_out, int rows, const std::string& filename) {
-    std::ofstream file(filename);
-    if (!file.is_open()) {
-        std::cerr << "Error: failed to open file " << filename << " for writing host vector to file.\n";
-        std::exit(EXIT_FAILURE);
-    }
-    
-    file << std::fixed << std::setprecision(10);
-    
-    for (int j = 0; j < rows; j++) {
-        file << h_out[j] << "\n";
-    }
-    
-    file.close();
 }
 
 __global__ void matrixMultiplyAddKernel(float* d_out, float* d_inL, float* d_inR, float* d_b, int rowsL, int K, int colsR, bool bias = true) {
@@ -341,22 +274,6 @@ __global__ void crossEntropyKernel(float* d_losses, float* d_probs, int* d_yb, i
     int col = d_yb[idx];
     
     d_losses[idx] = -logf(p[col]);
-}
-
-template <typename T>
-T getMeanFromArray(T* d_in, size_t size) {
-    std::vector<T> hSumOut(1);
-    CudaArray<T>   dSumOut(1);
-    
-    // first call to get temporary storage
-    void* tempStorage = nullptr;
-    size_t tempStorageBytes = 0;
-    CHECK_CUDA_ERROR(cub::DeviceReduce::Sum(tempStorage, tempStorageBytes, d_in, dSumOut.data(), size));
-    CHECK_CUDA_ERROR(cudaMalloc(&tempStorage, tempStorageBytes));
-    CHECK_CUDA_ERROR(cub::DeviceReduce::Sum(tempStorage, tempStorageBytes, d_in, dSumOut.data(), size));
-    dSumOut.copyToHostArray(hSumOut.data(), hSumOut.size());
-    
-    return hSumOut.data()[0] / static_cast<T>(size);
 }
 
 __global__ void subtractOneDivBKernel(float* d_out, int* d_yb, int B, int nHid2) {
@@ -438,48 +355,152 @@ __global__ void parameterUpdateKernel(float* d_params, float* d_grads, float lr,
     d_params[idx] -= lr * d_grads[idx];
 }
 
-template <typename T>
-T readParam(const std::string& paramName, const std::string& filename = "params.txt") {
+// File I/O
+void readTrainingData(std::vector<float>& h_Xtrain, std::vector<int>& h_ytrain, const std::string& filename = "mnist_train.csv") {
     std::ifstream file(filename);
     if (!file.is_open()) {
-        std::cerr << "Error opening " << filename << " for reading in hyperparameters.\n";
+        std::cerr << "Error reading training data from " << filename << ".\n";
         std::exit(EXIT_FAILURE);
     }
     
     std::string line;
     while (std::getline(file, line)) {
-        std::istringstream ss(line);
-        std::string name;
-        T value;
+        std::stringstream ss(line);
+        std::string c;
+        std::getline(ss, c, ','); // read first column; stop at , delimiter
+        int y = std::stoi(c);
+        h_ytrain.push_back(y);
         
-        if (ss >> name >> value) {
-            if (name == paramName) {
-                return value;
-            }
+        while (std::getline(ss, c, ',')) {
+            float x = std::stof(c);
+            h_Xtrain.push_back(x);
         }
     }
     
-    std::cerr << "Error: hyperparameter " << paramName << " not found in " << filename << ".\n";
-    std::exit(EXIT_FAILURE);
+    file.close();
 }
 
 template <typename T>
-std::vector<T> generateStandardNormalRandomVector(size_t N, int seed) {
-    std::mt19937 g(seed); // generator
-    std::normal_distribution<T> dis(0.0, 1.0);
-    std::vector<T> randomVec(N);
-    
-    for (int i = 0; i < N; i++) {
-        randomVec[i] = dis(g);
+void writeDeviceMatrixToFile(CudaArray<T>& d_out, int rows, int cols, const std::string& filename) {
+    if (rows * cols != d_out.size()) {
+        std::cerr << "Error: the number of entries to be written from the device matrix to " << filename << " does not match the matrix size.\n";
+        std::exit(EXIT_FAILURE);
     }
+    
+    std::vector<T> h_out(d_out.size());
+    d_out.copyToHostArray(h_out.data(), h_out.size());
+    
+    std::ofstream file(filename);
+    if (!file.is_open()) {
+        std::cerr << "Error: failed to open file " << filename << " for writing device matrix to file.\n";
+        std::exit(EXIT_FAILURE);
+    }
+    
+    file << std::fixed << std::setprecision(10);
+    
+    for (int j = 0; j < rows; j++) {
+        for (int i = 0; i < cols; i++) {
+            file << h_out[j * cols + i];
+            if (i < cols - 1) {
+                file << ",";
+            }
+        }
+        file << "\n";
+    }
+    
+    file.close();
+}
 
-    return randomVec;
+template <typename T>
+void writeDeviceVectorToFile(CudaArray<T>& d_out, int rows, const std::string& filename) {
+    if (rows != d_out.size()) {
+        std::cerr << "Error: the number of entries to be written from the device vector to " << filename << " does not match the vector size.\n";
+        std::exit(EXIT_FAILURE);
+    }
+    
+    std::vector<T> h_out(d_out.size());
+    d_out.copyToHostArray(h_out.data(), h_out.size());
+    
+    std::ofstream file(filename);
+    if (!file.is_open()) {
+        std::cerr << "Error: failed to open file " << filename << " for writing device vector to file.\n";
+        std::exit(EXIT_FAILURE);
+    }
+    
+    file << std::fixed << std::setprecision(10);
+    
+    for (int j = 0; j < rows; j++) {
+        file << h_out[j] << "\n";
+    }
+    
+    file.close();
+}
+
+template <typename T>
+void writeHostVectorToFile(std::vector<T> h_out, int rows, const std::string& filename) {
+    if (rows != h_out.size()) {
+        std::cerr << "Error: the number of entries to be written from the host vector to " << filename << " does not match the vector size.\n";
+        std::exit(EXIT_FAILURE);
+    }
+    
+    std::ofstream file(filename);
+    if (!file.is_open()) {
+        std::cerr << "Error: failed to open file " << filename << " for writing host vector to file.\n";
+        std::exit(EXIT_FAILURE);
+    }
+    
+    file << std::fixed << std::setprecision(10);
+    
+    for (int j = 0; j < rows; j++) {
+        file << h_out[j] << "\n";
+    }
+    
+    file.close();
+}
+
+// Tests
+void test(const std::string testMessage, bool test_cond) {
+    if (test_cond) {
+        std::cout << "Succeeded in " << testMessage << ".\n";
+    } else {
+        std::cout << "Failed in " << testMessage << ".\n";
+        std::exit(EXIT_FAILURE);
+    }
+}
+
+bool testCudaArray() {
+    const int NUM_ELEMS = 1 << 20; // 2^20 
+    std::vector<float> h_in(NUM_ELEMS);
+    std::vector<float> h_out(NUM_ELEMS, 0.0f);
+    
+    for (int i = 0; i < NUM_ELEMS; i++) {
+        h_in[i] = static_cast<float>(i);
+    }
+    
+    CudaArray<float> d_in(h_in.data(), h_in.size());
+    CudaArray<float> d_out(h_out.data(), h_out.size());
+    
+    const int blockSize = 256;
+    const int numBlocks = NUM_ELEMS / blockSize; // powers of 2 always divisible
+    const int numThreads = NUM_ELEMS;
+    
+    test_kernel<<<numBlocks, blockSize>>>(d_in.data(), d_out.data(), numThreads);
+    
+    d_out.copyToHostArray(h_out.data(), h_out.size());
+    
+    for (int i = 0; i < h_in.size(); i++) {
+        if (!are_floats_equal(h_in[i], h_out[i])) {
+            return false;
+        }
+    }
+    
+    return true;
 }
 
 int main(int argc, char** argv) {
     test("correctly initialising a CudaArray and then populating it with a kernel", testCudaArray());
     
-    // tensor sizes and hyperparameters
+    // tensor sizes, hyperparameters, CUDA parameters
     const int Xrows = 60000;
     const int Xcols = 784;
     const int batchSize = readParam<float>("batchSize");
@@ -490,6 +511,7 @@ int main(int argc, char** argv) {
     const float lr = readParam<float>("lr");
     int epochs = readParam<int>("epochs");
     std::vector<float> losses(epochs);
+    const int blockSize = 256;
     
     std::vector<float> h_Xtrain;
     std::vector<int>   h_ytrain;
@@ -529,7 +551,6 @@ int main(int argc, char** argv) {
     CudaArray<float> d_actT(nHid1 * B);
     
     // populating tensors
-    int blockSize = 256;
     int seed = 21431;
     
     // weight tensors are initialised as random normal
@@ -537,7 +558,6 @@ int main(int argc, char** argv) {
     std::vector<float> rVec2 = generateStandardNormalRandomVector<float>(d_W2.size(), seed);
     d_W1.copyFromHostArray(rVec1.data(), rVec1.size());
     d_W2.copyFromHostArray(rVec2.data(), rVec2.size());
-    
     
     // biases, layer and gradient tensors can just be zero initialised
     cudaMemset(d_Xb.data(),      0, d_Xb.size());
