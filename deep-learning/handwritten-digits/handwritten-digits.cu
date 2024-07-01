@@ -7,7 +7,8 @@
 #include <iomanip> // for output file precision
 #include <cuda_runtime.h>
 #include <cooperative_groups.h> // CUDA cooperative groups
-#include <cooperative_groups/reduce.h> // CUDA cooperative groups
+#include <cooperative_groups/reduce.h>
+#include <cub/cub.cuh>
 
 #define CEIL_DIV(x, y) (x / y + ((x % y) != 0))
 
@@ -264,17 +265,17 @@ void writeDeviceVectorToFile(CudaArray<T>& d_out, int rows, const std::string& f
 // d_inR: K x colsR
 // d_out: rowsL x colsR
 // d_b: 1 x colsR
-__global__ void matrixMultiplyAddKernel(float* d_out, float* d_inL, float* d_inR, float* d_b, int rowsL, int K, int colsR) {
+__global__ void matrixMultiplyAddKernel(float* d_out, float* d_inL, float* d_inR, float* d_b, int rowsL, int K, int colsR, bool bias = true) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int row = idx / colsR;
     int col = idx % colsR;
 
     if (row < rowsL && col < colsR) {
-        float value = 0.0f;
+        float value = (bias) ? d_b[col] : 0.0f;
         for (int i = 0; i < K; i++) {
             value += d_inL[row * K + i] * d_inR[i * colsR + col];
         }
-        d_out[row * colsR + col] = value + d_b[col];
+        d_out[row * colsR + col] = value;
     }
 }
 
@@ -288,7 +289,7 @@ __global__ void tanhKernel(float* d_out, float* d_in, int nt) {
     d_out[idx] = tanhf(d_in[idx]);
 }
 
-__global__ void softmaxKernel(float* d_probs, float* d_logits, int B, int nHid2) {
+__global__ void softmaxKernel(float* d_probs, float* d_logits, int B, int nHid2, bool backward = false) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     
     if (idx >= B) {
@@ -309,13 +310,13 @@ __global__ void softmaxKernel(float* d_probs, float* d_logits, int B, int nHid2)
     
     float* p = d_probs + idx * nHid2;
     for (int i = 0; i < nHid2; i++) {
-        p[i] = max(1e-8f, expf(l[i] - maxx) / sum);
+        p[i] = (!backward) ? max(1e-8f, expf(l[i] - maxx) / sum) : max(1e-8f, expf(l[i] - maxx) / sum) / B;
     }
     
     /*namespace cg = cooperative_groups;
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
-    // meta_group_size is the number of warps in a block, and meta_group_rank is the warp index
+    // meta_group_size is the number of warps in a block, and meta_group_rank is the warp idx
     int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
     if(idx >= B) {
         return;
@@ -359,6 +360,108 @@ __global__ void crossEntropyKernel(float* d_losses, float* d_probs, int* d_yb, i
     d_losses[idx] = -logf(p[col]);
 }
 
+template <typename T>
+T getMeanFromArray(T* d_in, size_t size) {
+    std::vector<T> hSumOut(1);
+    CudaArray<T>   dSumOut(1);
+    
+    // first call to get temporary storage
+    void* tempStorage = nullptr;
+    size_t tempStorageBytes = 0;
+    CHECK_CUDA_ERROR(cub::DeviceReduce::Sum(tempStorage, tempStorageBytes, d_in, dSumOut.data(), size));
+    CHECK_CUDA_ERROR(cudaMalloc(&tempStorage, tempStorageBytes));
+    CHECK_CUDA_ERROR(cub::DeviceReduce::Sum(tempStorage, tempStorageBytes, d_in, dSumOut.data(), size));
+    dSumOut.copyToHostArray(hSumOut.data(), hSumOut.size());
+    
+    return hSumOut.data()[0] / static_cast<T>(size);
+}
+
+__global__ void subtractOneDivBKernel(float* d_out, int* d_yb, int B, int nHid2) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx >= B) {
+        return;
+    }
+    
+    float* out = d_out + idx * nHid2;
+    
+    int col = d_yb[idx];
+    
+    out[col] -= 1.0f / B;
+}
+
+__global__ void transposeKernel(float* d_out, const float* d_in, int rows, int cols) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx >= rows * cols) {
+        return;
+    }
+    
+    int row = idx / cols;
+    int col = idx % cols;
+
+    int idxT = col * rows + row;
+    d_out[idxT] = d_in[idx];
+
+}
+
+// this kernel performs a column-wise reduction over dout, in PyTorch equivalent to:
+// dbias = dout.sum((0,1))
+// the idea is to employ one block to reduce along several columns,
+// where each block has a width of 32 columns to ensure coalesced access.
+// at the end we accumulate the reductions performed by the warps in each block via shared memory
+__global__ void biasBackwardKernel(float* dbias, const float* dout, int rows, int cols) {
+    // this kernel is launched with 1D grid_dim of OC/32
+    // for example let's say block_size is 128
+    extern __shared__ float smem[]; // of size block_size (128)
+    const int warp_id = threadIdx.x / warpSize; // warp index in the block, 0,1,2,3
+    const int lane_id = threadIdx.x % warpSize; // thread index in the warp, 0,1,2,...,31
+    const int tl = blockIdx.x * warpSize; // pointer to the start column for this block
+    const int vstep = blockDim.x / warpSize; // number of warps in a block, e.g. 4
+    const int col = tl + lane_id;
+    
+    if (col >= cols) { // handling cols % 32 != 0
+        return;
+    }
+    
+    // pointer to the start of the column for one lane of threads
+    // so e.g. 4 (`vstep`) threads (of the same lane_id) will reduce this one column
+    const float* dout_col = dout + col;
+    
+    // column reductions by looping through the rows
+    // each of the 4 threads offsets by its warp_id and then skips by vstep
+    // together these 4 threads cover all B*T rows of this (lane_id) column
+    // importantly, consecutive threads (in threadId) are processing adjacent columns,
+    // leading to a coalesced memory access pattern
+    float dout_sum = 0.0f;
+    for (int row = warp_id; row < rows; row += vstep) {
+        dout_sum += (float)dout_col[row * cols];
+    }
+    smem[lane_id + warp_id * warpSize] = dout_sum;
+    __syncthreads();
+
+    // warp_id 0 reduces the shared memory column-wise, linearly
+    dout_sum = 0.0f;
+    if (warp_id == 0) {
+        for (int j = 0; j < vstep; j++) {
+            dout_sum += smem[lane_id + j * warpSize];
+        }
+        dbias[tl + lane_id] = (float)dbias[tl + lane_id] + dout_sum;
+    }
+}
+
+__global__ void tanhBackwardKernel(float* d_dlin, float* d_dact, float* d_act, int nt) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx >= nt) {
+        return;
+    }
+    
+    d_dlin[idx] = d_dact[idx] * (1 - d_act[idx] * d_act[idx]);
+}
+
+__global__ void
+
 int main(int argc, char** argv) {
     test("correctly initialising a CudaArray and then populating it with a kernel", testCudaArray());
     
@@ -378,18 +481,34 @@ int main(int argc, char** argv) {
     test("reading in the correct number of X training data (60000 rows x 784 columns)", h_Xtrain.size() == Xrows * Xcols);
     test("reading in the correct number of y training data (60000 rows)", h_ytrain.size() == Xrows);
     
-    // parameter and layer tensors
-    CudaArray<float> d_Xb(B * Xcols);
-    CudaArray<int>   d_yb(B);
+    // parameter tensors
     CudaArray<float> d_W1(Xcols * nHid1);
     CudaArray<float> d_b1(nHid1);
-    CudaArray<float> d_lin(B * nHid1);
-    CudaArray<float> d_act(B * nHid1);
     CudaArray<float> d_W2(nHid1 * nHid2);
     CudaArray<float> d_b2(nHid2);
+    
+    // layer tensors
+    CudaArray<float> d_Xb(B * Xcols);
+    CudaArray<int>   d_yb(B);
+    CudaArray<float> d_lin(B * nHid1);
+    CudaArray<float> d_act(B * nHid1);
     CudaArray<float> d_logits(B * nHid2);
     CudaArray<float> d_probs(B * nHid2);
     CudaArray<float> d_losses(B);
+    
+    // gradient tensors
+    CudaArray<float> d_dlogits(B * nHid2);
+    CudaArray<float> d_db2(nHid2);
+    CudaArray<float> d_dW2(B * nHid2);
+    CudaArray<float> d_dact(B * nHid1);
+    CudaArray<float> d_dlin(B * nHid1);
+    CudaArray<float> d_db1(nHid1);
+    CudaArray<float> d_dW1(Xcols * nHid1);
+    
+    // transpose tensors
+    CudaArray<float> d_XbT(Xcols * B);
+    CudaArray<float> d_W2T(nHid2 * nHid1);
+    CudaArray<float> d_actT(nHid1 * B);
     
     // populating tensors
     int blockSize = 256;
@@ -403,13 +522,23 @@ int main(int argc, char** argv) {
     populateTensorRandomNormalKernel<<<CEIL_DIV(d_W2.size(), blockSize), blockSize>>>(d_W2.data(), d_W2.size(), mean, stddev, seed);
     populateTensorRandomNormalKernel<<<CEIL_DIV(d_b2.size(), blockSize), blockSize>>>(d_b2.data(), d_b2.size(), mean, stddev, seed);
     
-    // layer tensors can just be zero initialised
-    cudaMemset(d_Xb.data(),     0, d_Xb.size());
-    cudaMemset(d_yb.data(),     0, d_yb.size());
-    cudaMemset(d_lin.data(),    0, d_lin.size());
-    cudaMemset(d_act.data(),    0, d_act.size());
-    cudaMemset(d_logits.data(), 0, d_logits.size());
-    cudaMemset(d_probs.data(),  0, d_probs.size());
+    // layer and gradient tensors can just be zero initialised
+    cudaMemset(d_Xb.data(),      0, d_Xb.size());
+    cudaMemset(d_yb.data(),      0, d_yb.size());
+    cudaMemset(d_lin.data(),     0, d_lin.size());
+    cudaMemset(d_act.data(),     0, d_act.size());
+    cudaMemset(d_logits.data(),  0, d_logits.size());
+    cudaMemset(d_probs.data(),   0, d_probs.size());
+    cudaMemset(d_dlogits.data(), 0, d_dlogits.size());
+    cudaMemset(d_db2.data(),     0, d_db2.size());
+    cudaMemset(d_dW2.data(),     0, d_dW2.size());
+    cudaMemset(d_dact.data(),    0, d_dact.size());
+    cudaMemset(d_dlin.data(),    0, d_dlin.size());
+    cudaMemset(d_db1.data(),     0, d_db1.size());
+    cudaMemset(d_dW1.data(),     0, d_dW1.size());
+    cudaMemset(d_XbT.data(),     0, d_XbT.size());
+    cudaMemset(d_W2T.data(),     0, d_W2T.size());
+    cudaMemset(d_actT.data(),    0, d_actT.size());
     
     // forward
     getMiniBatchFromHost(h_Xtrain, h_ytrain, d_Xb, d_yb, Xrows, Xcols, batchSize, 1);
@@ -418,8 +547,9 @@ int main(int argc, char** argv) {
     matrixMultiplyAddKernel<<<CEIL_DIV(d_logits.size(), blockSize), blockSize>>>(d_logits.data(), d_act.data(), d_W2.data(), d_b2.data(), B, nHid1, nHid2);
     softmaxKernel<<<CEIL_DIV(B, blockSize), blockSize>>>(d_probs.data(), d_logits.data(), B, nHid2);
     crossEntropyKernel<<<CEIL_DIV(B, blockSize), blockSize>>>(d_losses.data(), d_probs.data(), d_yb.data(), B, nHid2);
-    
-    CHECK_CUDA_ERROR(cudaPeekAtLastError())
+    float loss = getMeanFromArray<float>(d_losses.data(), d_losses.size());
+    CHECK_CUDA_ERROR(cudaPeekAtLastError());
+    std::cout << "Loss (CUDA): " << loss;
     
     // writing data for testing against pytorch
     writeDeviceMatrixToFile<float>(d_Xb, batchSize, Xcols, "Xb.csv");
@@ -433,5 +563,32 @@ int main(int argc, char** argv) {
     writeDeviceMatrixToFile<float>(d_logits, B, nHid2, "logits.csv");
     writeDeviceMatrixToFile<float>(d_probs, B, nHid2, "probs.csv");
     writeDeviceVectorToFile<float>(d_losses, B, "losses.csv");
+    
+    // backward
+    softmaxKernel<<<CEIL_DIV(B, blockSize), blockSize>>>(d_dlogits.data(), d_logits.data(), B, nHid2, true);
+    subtractOneDivBKernel<<<CEIL_DIV(B, blockSize), blockSize>>>(d_dlogits.data(), d_yb.data(), B, nHid2);
+    transposeKernel<<<CEIL_DIV(d_W2.size(), blockSize), blockSize>>>(d_W2T.data(), d_W2.data(), nHid1, nHid2);
+    matrixMultiplyAddKernel<<<CEIL_DIV(d_dact.size(), blockSize), blockSize>>>(d_dact.data(), d_dlogits.data(), d_W2T.data(), nullptr, B, nHid2, nHid1, false);
+    transposeKernel<<<CEIL_DIV(d_actT.size(), blockSize), blockSize>>>(d_actT.data(), d_act.data(), B, nHid1);
+    matrixMultiplyAddKernel<<<CEIL_DIV(d_dW2.size(), blockSize), blockSize>>>(d_dW2.data(), d_actT.data(), d_dlogits.data(), nullptr, nHid1, B, nHid2, false);
+    biasBackwardKernel<<<CEIL_DIV(B, 32), blockSize, blockSize * sizeof(float)>>>(d_db2.data(), d_dlogits.data(), B, nHid2);
+    tanhBackwardKernel<<<CEIL_DIV(d_dlin.size(), blockSize), blockSize>>>(d_dlin.data(), d_dact.data(), d_act.data(), d_dlin.size());
+    transposeKernel<<<CEIL_DIV(d_Xb.size(), blockSize), blockSize>>>(d_XbT.data(), d_Xb.data(), B, Xcols);
+    matrixMultiplyAddKernel<<<CEIL_DIV(d_dW1.size(), blockSize), blockSize>>>(d_dW1.data(), d_XbT.data(), d_dlin.data(), nullptr, Xcols, B, nHid1, false);
+    biasBackwardKernel<<<CEIL_DIV(B, 32), blockSize, blockSize * sizeof(float)>>>(d_db1.data(), d_dlin.data(), B, nHid1);
+    CHECK_CUDA_ERROR(cudaPeekAtLastError());
+    
+    // writing data
+    writeDeviceMatrixToFile<float>(d_dlogits, B, nHid2, "dlogits.csv");
+    writeDeviceMatrixToFile<float>(d_dact, B, nHid1, "dact.csv");
+    writeDeviceMatrixToFile<float>(d_W2T, nHid2, nHid1, "W2T.csv");
+    writeDeviceMatrixToFile<float>(d_dW2, nHid1, nHid2, "dW2.csv");
+    writeDeviceVectorToFile<float>(d_db2, nHid2, "db2.csv");
+    writeDeviceMatrixToFile<float>(d_dlin, B, nHid1, "dlin.csv");
+    writeDeviceMatrixToFile<float>(d_XbT, Xcols, B, "XbT.csv");
+    writeDeviceMatrixToFile<float>(d_dW1, Xcols, nHid1, "dW1.csv");
+    writeDeviceVectorToFile<float>(d_db1, nHid1, "db1.csv");
+    
+    
     
 }

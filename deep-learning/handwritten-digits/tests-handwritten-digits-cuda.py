@@ -10,21 +10,29 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 def main():
     #test_minibatch_loading()
     #test_params_distribution()
-    #test_matmul1()
-    #test_matmul2()
-    #test_tanh()
-    #test_softmax()
+    test_matmul1()
+    test_tanh()
+    test_matmul2()
+    test_softmax()
     test_cross_entropy()
+    test_logits_backward()
+    test_transpose()
+    test_act_backward()
+    test_W2_backward()
+    test_b2_backward()
+    test_tanh_backward()
+    test_W1_backward()
+    test_b1_backward()
     
 def compare(operation, t, pt, n = 100):
-    maxdiff = (t - pt).abs().max().item()
+    maxerr = (t - pt).abs().max().item()
     
     if torch.allclose(t, pt):
-        print(f'{operation} is close, maxdiff: {maxdiff}')
+        print(f'{operation:20} success, max error: {maxerr:.2e}')
     else:
-        print(f'{operation} failed, maxdiff: {maxdiff}')
+        print(f'{operation:20} failure, max error: {maxerr:.2e}')
         
-    if t.ndim == 2:
+    if False:#t.ndim == 2:
         plt.imshow((t - pt)[:n].tolist())
         plt.title(f'{operation} differences')
         plt.show()
@@ -77,35 +85,89 @@ def test_matmul1():
     b1 = torch.from_numpy(np.loadtxt('b1.csv', delimiter=',', dtype=np.float32)).to(device).view((1,W1.shape[1]))
     lin = torch.from_numpy(np.loadtxt('lin.csv', delimiter=',', dtype=np.float32)).to(device)
     lin_t = Xb @ W1 + b1
-    compare('matmul1', lin, lin_t)
+    compare('Matmul1', lin, lin_t)
     
+def test_tanh():
+    lin = torch.from_numpy(np.loadtxt('lin.csv', delimiter=',', dtype=np.float32)).to(device)
+    act = torch.from_numpy(np.loadtxt('act.csv', delimiter=',', dtype=np.float32)).to(device)
+    act_t = torch.tanh(lin)
+    compare('Tanh', act, act_t)
+
 def test_matmul2():
     act = torch.from_numpy(np.loadtxt('act.csv', delimiter=',', dtype=np.float32)).to(device)
     W2 = torch.from_numpy(np.loadtxt('W2.csv', delimiter=',', dtype=np.float32)).to(device)
     b2 = torch.from_numpy(np.loadtxt('b2.csv', delimiter=',', dtype=np.float32)).to(device).view((1,W2.shape[1]))
     logits = torch.from_numpy(np.loadtxt('logits.csv', delimiter=',', dtype=np.float32)).to(device)
     logits_t = act @ W2 + b2
-    compare('matmul2', logits, logits_t)
+    compare('Matmul2', logits, logits_t)
     
-def test_tanh():
-    lin = torch.from_numpy(np.loadtxt('lin.csv', delimiter=',', dtype=np.float32)).to(device)
-    act = torch.from_numpy(np.loadtxt('act.csv', delimiter=',', dtype=np.float32)).to(device)
-    act_t = torch.tanh(lin)
-    compare('tanh', act, act_t)
-
 def test_softmax():
     logits = torch.from_numpy(np.loadtxt('logits.csv', delimiter=',', dtype=np.float32)).to(device)
     probs = torch.from_numpy(np.loadtxt('probs.csv', delimiter=',', dtype=np.float32)).to(device)
     probs_t = F.softmax(logits, dim=1)
-    compare('softmax', probs, probs_t)
+    compare('Softmax', probs, probs_t)
     
 def test_cross_entropy():
     yb = torch.from_numpy(np.loadtxt('yb.csv', delimiter=',', dtype=np.int64)).to(device)
     probs = torch.from_numpy(np.loadtxt('probs.csv', delimiter=',', dtype=np.float32)).to(device)
     losses = torch.from_numpy(np.loadtxt('losses.csv', delimiter=',', dtype=np.float32)).to(device)
     losses_t = -probs[range(yb.shape[0]), yb].log()
-    np.savetxt('losses_t.csv', losses_t.view(-1).cpu().numpy(), delimiter=',')
-    compare('cross entropy', losses, losses_t)
+    compare('Cross entropy', losses, losses_t)
+    
+def test_logits_backward():
+    yb = torch.from_numpy(np.loadtxt('yb.csv', delimiter=',', dtype=np.int64)).to(device)
+    logits = torch.from_numpy(np.loadtxt('logits.csv', delimiter=',', dtype=np.float32)).to(device)
+    dlogits = torch.from_numpy(np.loadtxt('dlogits.csv', delimiter=',', dtype=np.float32)).to(device)
+    B = yb.shape[0]
+    dlogits_t = F.softmax(logits, dim=1)
+    dlogits_t[range(B), yb] -= 1
+    dlogits_t /= B
+    compare('Logits backward', dlogits, dlogits_t)
+    
+def test_transpose():
+    W2 = torch.from_numpy(np.loadtxt('W2.csv', delimiter=',', dtype=np.float32)).to(device)
+    W2T = torch.from_numpy(np.loadtxt('W2T.csv', delimiter=',', dtype=np.float32)).to(device)
+    compare('Transpose', W2T, W2.T)
+
+def test_act_backward():
+    dlogits = torch.from_numpy(np.loadtxt('dlogits.csv', delimiter=',', dtype=np.float32)).to(device)
+    W2 = torch.from_numpy(np.loadtxt('W2.csv', delimiter=',', dtype=np.float32)).to(device)
+    dact = torch.from_numpy(np.loadtxt('dact.csv', delimiter=',', dtype=np.float32)).to(device)
+    dact_t = dlogits @ W2.T
+    compare('Act backward', dact, dact_t)
+
+def test_W2_backward():
+    act = torch.from_numpy(np.loadtxt('act.csv', delimiter=',', dtype=np.float32)).to(device)
+    dlogits = torch.from_numpy(np.loadtxt('dlogits.csv', delimiter=',', dtype=np.float32)).to(device)
+    dW2 = torch.from_numpy(np.loadtxt('dW2.csv', delimiter=',', dtype=np.float32)).to(device)
+    dW2_t = act.T @ dlogits
+    compare('W2 backward', dW2, dW2_t)
+
+def test_b2_backward():
+    dlogits = torch.from_numpy(np.loadtxt('dlogits.csv', delimiter=',', dtype=np.float32)).to(device)
+    db2 = torch.from_numpy(np.loadtxt('db2.csv', delimiter=',', dtype=np.float32)).to(device).view((1,dlogits.shape[1]))
+    db2_t = dlogits.sum(dim=0, keepdims=True)
+    compare('b2 backward', db2, db2_t)
+    
+def test_tanh_backward():
+    dact = torch.from_numpy(np.loadtxt('dact.csv', delimiter=',', dtype=np.float32)).to(device)
+    act = torch.from_numpy(np.loadtxt('act.csv', delimiter=',', dtype=np.float32)).to(device)
+    dlin = torch.from_numpy(np.loadtxt('dlin.csv', delimiter=',', dtype=np.float32)).to(device)
+    dlin_t = dact * (1 - act ** 2)
+    compare('Tanh backward', dlin, dlin_t)
+
+def test_W1_backward():
+    Xb = torch.from_numpy(np.loadtxt('Xb.csv', delimiter=',', dtype=np.float32)).to(device)
+    dlin = torch.from_numpy(np.loadtxt('dlin.csv', delimiter=',', dtype=np.float32)).to(device)
+    dW1 = torch.from_numpy(np.loadtxt('dW1.csv', delimiter=',', dtype=np.float32)).to(device)
+    dW1_t = Xb.T @ dlin
+    compare('W1 backward', dW1, dW1_t)
+
+def test_b1_backward():
+    dlin = torch.from_numpy(np.loadtxt('dlin.csv', delimiter=',', dtype=np.float32)).to(device)
+    db1 = torch.from_numpy(np.loadtxt('db1.csv', delimiter=',', dtype=np.float32)).to(device).view((1,dlin.shape[1]))
+    db1_t = dlin.sum(dim=0, keepdims=True)
+    compare('b1 backward', db1, db1_t)
     
 if __name__ == '__main__':
     main()
