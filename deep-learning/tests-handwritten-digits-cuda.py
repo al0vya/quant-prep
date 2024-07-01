@@ -51,10 +51,12 @@ def test_params_distribution():
     plt.show()
     
 def test_matmul():
-    Xb  = torch.from_numpy(np.loadtxt('Xb.csv',  delimiter=',', dtype=np.float32))
-    W1  = torch.from_numpy(np.loadtxt('W1.csv',  delimiter=',', dtype=np.float32))
-    b1  = torch.from_numpy(np.loadtxt('b1.csv',  delimiter=',', dtype=np.float32)).view((1,100))
-    lin = torch.from_numpy(np.loadtxt('lin.csv', delimiter=',', dtype=np.float32))
+    # doing computations on the GPU is very important to make sure PyTorch/CUDA comparisons match, otherwise they will not
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    Xb  = torch.from_numpy(np.loadtxt('Xb.csv',  delimiter=',', dtype=np.float32)).to(device)
+    W1  = torch.from_numpy(np.loadtxt('W1.csv',  delimiter=',', dtype=np.float32)).to(device)
+    b1  = torch.from_numpy(np.loadtxt('b1.csv',  delimiter=',', dtype=np.float32)).to(device).view((1,100))
+    lin = torch.from_numpy(np.loadtxt('lin.csv', delimiter=',', dtype=np.float32)).to(device)
     
     lin_torch = Xb @ W1 + b1
     
@@ -64,6 +66,9 @@ def test_matmul():
         print(f'Matmul is close, maxdiff: {maxdiff}')
     else:
         print(f'Matmul failed, maxdiff: {maxdiff}')
-
+    
+    plt.imshow((lin - lin_torch)[:100].tolist())
+    plt.show()
+    
 if __name__ == '__main__':
     main()

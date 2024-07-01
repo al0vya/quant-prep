@@ -5,6 +5,7 @@
 #include <string>
 #include <cmath>
 #include <cuda_runtime.h>
+#include <iomanip>
 
 #define CEIL_DIV(x, y) (x / y + ((x % y) != 0))
 
@@ -161,7 +162,7 @@ __global__ void populateTensorRandomNormalKernel(float* d_out, int nt, float mea
 
     // Box-Muller transform
     float r = sqrtf(-2.0f * logf(u1));
-    float theta = 2.0f * 3.141592 * u2;
+    float theta = 2.0f * 3.141592f * u2;
 
     // generating normally distributed random number
     float z0 = r * cosf(theta);
@@ -230,6 +231,8 @@ void writeDeviceMatrixToFile(CudaArray<float>& d_out, int rows, int cols, const 
         exit(-1);
     }
     
+    file << std::fixed << std::setprecision(9);
+    
     for (int j = 0; j < rows; j++) {
         for (int i = 0; i < cols; i++) {
             file << h_out[j * cols + i];
@@ -252,6 +255,8 @@ void writeDeviceVectorToFile(CudaArray<float>& d_out, int rows, const std::strin
         std::cerr << "Error: failed to open file " << filename << " for writing device vector to file.\n";
         exit(-1);
     }
+    
+    file << std::fixed << std::setprecision(9);
     
     for (int j = 0; j < rows; j++) {
         file << h_out[j] << "\n";
@@ -331,14 +336,13 @@ int main(int argc, char** argv) {
     
     getMiniBatchFromHost(h_Xtrain, h_ytrain, d_Xb, d_yb, Xrows, Xcols, batchSize, 1);
     
+    //__global__ void matrixMultiplyAddKernel(float* d_out, float* d_inL, float* d_inR, float* d_b, int rowsL, int K, int colsR)
+    matrixMultiplyAddKernel<<<CEIL_DIV(d_lin.size(), blockSize), blockSize>>>(d_lin.data(), d_Xb.data(), d_W1.data(), d_b1.data(), B, Xcols, n_hid1);
+    
     writeDeviceMatrixToFile(d_Xb, batchSize, Xcols, "Xb.csv");
     writeDeviceVectorToFile(d_yb, batchSize, "yb.csv");
     writeDeviceMatrixToFile(d_W1, Xcols, n_hid1, "W1.csv");
     writeDeviceVectorToFile(d_b1, n_hid1, "b1.csv");
-    
-    //__global__ void matrixMultiplyAddKernel(float* d_out, float* d_inL, float* d_inR, float* d_b, int rowsL, int K, int colsR)
-    matrixMultiplyAddKernel<<<CEIL_DIV(d_lin.size(), blockSize), blockSize>>>(d_lin.data(), d_Xb.data(), d_W1.data(), d_b1.data(), B, Xcols, n_hid1);
-    
     writeDeviceMatrixToFile(d_lin, B, n_hid1, "lin.csv");
     
     CHECK_CUDA_ERROR(cudaPeekAtLastError())
