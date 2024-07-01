@@ -284,6 +284,15 @@ __global__ void matrixMultiplyAddKernel(float* d_out, float* d_inL, float* d_inR
     }
 }
 
+__global__ void tanh_kernel(float* d_out, float* d_in, int nt) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx >= nt) {
+        return;
+    }
+    
+    d_out[idx] = tanhf(d_in[idx]);
+}
 
 int main(int argc, char** argv) {
     test("correctly initialising a CudaArray and then populating it with a kernel", testCudaArray());
@@ -344,6 +353,10 @@ int main(int argc, char** argv) {
     writeDeviceMatrixToFile(d_W1, Xcols, n_hid1, "W1.csv");
     writeDeviceVectorToFile(d_b1, n_hid1, "b1.csv");
     writeDeviceMatrixToFile(d_lin, B, n_hid1, "lin.csv");
+    
+    tanh_kernel<<<CEIL_DIV(d_act.size(), blockSize), blockSize>>>(d_act.data(), d_lin.data(), d_act.size());
+    
+    writeDeviceMatrixToFile(d_act, B, n_hid1, "act.csv");
     
     CHECK_CUDA_ERROR(cudaPeekAtLastError())
 }
