@@ -30,9 +30,9 @@ def compare(operation, t, pt, n = 100):
     maxerr = (t - pt).abs().max().item()
     
     if torch.allclose(t, pt):
-        print(f'{operation:20} success, max error: {maxerr:.2e}')
+        print(f'{operation:20} torch.allclose passed, max error: {maxerr:.2e}')
     else:
-        print(f'{operation:20} failure, max error: {maxerr:.2e}')
+        print(f'{operation:20} torch.allclose failed, max error: {maxerr:.2e}')
         
     if False:#t.ndim == 2:
         plt.imshow((t - pt)[:n].tolist())
@@ -66,6 +66,7 @@ def test_minibatch_loading():
         ax.xaxis.set_ticks([]); ax.xaxis.set_ticklabels([])
         ax.yaxis.set_ticks([]); ax.yaxis.set_ticklabels([])
     
+    fig.suptitle('Minibatch data')
     fig.tight_layout()
     plt.show()
     
@@ -76,8 +77,8 @@ def test_params_distribution():
     fig, axs = plt.subplots(nrows=2)
     axs[0].hist(W1.flat, bins=200)
     axs[1].hist(b1.flat, bins=200)
-    axs[0].set_title(f'Weights')
-    axs[1].set_title(f'Biases')
+    axs[0].set_title(f'Initial distribution of weights')
+    axs[1].set_title(f'Initial distribution of biases')
     fig.tight_layout()
     plt.show()
     
@@ -172,9 +173,12 @@ def test_b1_backward():
     compare('b1 backward', db1, db1_t)
     
 def plot_loss_metrics():
-    df = pd.read_csv('training-losses.csv', header=None)
-    df.plot()
+    data = np.loadtxt('training-losses.csv')
+    fig, ax = plt.subplots()
+    ax.plot(data)
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Training loss')
     plt.show()
-
+    
 if __name__ == '__main__':
     main()
