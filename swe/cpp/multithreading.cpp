@@ -159,39 +159,50 @@ public:
     // [. . x x .] -> produce(x) -> [. . x x x]
     //      ^   ^                    ^   ^
     //      t   h                    h   t
-    void produce(T item) {
-        if (m_count == MAX_ITEMS) {
+    void produce(std::unique_ptr<T> item) {
+        /*if (m_count == MAX_ITEMS) {
+            LOG("Buffer is full, cannot produce more items until some are consumed.")
             return;
-        }
-        
-        m_items[head] = item;
+        }*/
+        std::unique_lock<std::mutex> lock(m_mtx);
+        m_cv_producer.wait(lock, [&] { return m_count < MAX_ITEMS; });
+        m_items[m_head] = std::move(item);
         m_count++;
         m_head = (m_head + 1) % MAX_ITEMS;
+        lock.unlock();
+        m_cv_consumer.notify_one();
     }
     
-    T consume() {
-        if (m_count == 0) {
-            return T();
-        }
-        
-        T popped = m_items[m_tail];
+    std::unique_ptr<T> consume() {
+        /*if (m_count == 0) {
+            LOG("Buffer is empty, cannot consume any more items until more are produced.")
+            return nullptr;
+        }*/
+        std::unique_lock<std::mutex> lock(m_mtx);
+        m_cv_consumer.wait(lock, [&] { return m_count > 0; });
+        std::unique_ptr<T> consumed = std::move(m_items[m_tail]);
         m_count--;
         m_tail = (m_tail + 1) % MAX_ITEMS;
-        return popped;
+        lock.unlock();
+        m_cv_producer.notify_one();
+        return consumed;
     }
 
 private:
     int m_head;
     int m_tail;
     int m_count;
-    T m_items[MAX_ITEMS];
+    std::unique_ptr<T> m_items[MAX_ITEMS];
+    std::mutex m_mtx;
+    std::condition_variable m_cv_producer;
+    std::condition_variable m_cv_consumer;
 };
 
 class HeapClass {
 public:
-    HeapClass() : m_size(0) {
-        LOG("HeapClass default constructed!")
-        m_data = nullptr;
+    HeapClass() : m_size(10) {
+        LOG("HeapClass default constructed with size 10!")
+        m_data = new int[m_size];
     }
     
     HeapClass(int size) : m_size(size) {
@@ -223,8 +234,10 @@ public:
     }
     
     ~HeapClass() {
-        LOG("HeapClass destructed!")
-        delete[] m_data;
+        if (m_data != nullptr) {
+            LOG("HeapClass destructed!")
+            delete[] m_data;
+        }
     }
     
 private:
@@ -233,12 +246,37 @@ private:
 };
 
 void use_producer_consumer() {
-    ProducerConsumer<int, 5> pc;
-    HeapClass hc1(10); // constructed
-    HeapClass hc2(std::move(hc1)); // move constructed
-    HeapClass hc3; // default constructed
-    hc2 = std::move(hc3); // move assigned
-    // hc1, hc2, hc3, all three destructed
+    /*{
+        HeapClass hc1(10); // constructed
+        HeapClass hc2(std::move(hc1)); // move constructed
+        HeapClass hc3; // default constructed
+        hc2 = std::move(hc3); // move assigned
+        // hc1, hc2, hc3, all three destructed
+    }*/
+    
+    LOG("Constructing a ProducerConsumer with MAX_ITEMS = 5")
+    const int N = 5;
+    ProducerConsumer<HeapClass, N> pc;
+    
+    LOG("Producing 4 items")
+    std::thread producer([&] {
+        for (int i = 0; i < N - 1; i++) {
+            pc.produce(std::make_unique<HeapClass>(HeapClass(i)));
+        }
+    });
+    
+    LOG("Consuming 3 items")
+    std::thread consumer([&] {
+        for (int i = 0; i < N - 2; i++) {
+            LOG("Consuming")
+            auto consumed = pc.consume();
+        }
+    });
+    
+    producer.join();
+    consumer.join();
+    
+    LOG("Production-consumption finished.")
 }
 
 int main() {
