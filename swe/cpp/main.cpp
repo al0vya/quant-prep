@@ -460,8 +460,9 @@ void moveAssignment() {
     
     PRINT("Then we do dst2 = std::move(src3) whose name is")
     dst2.Print();
-    PRINT("So the name of String src(\"src\") has been taken by dst2 and is now")
-    src3.Print();
+    PRINT("So the name of String src3(\"src3\") has been taken by dst2 and is now empty")
+    //src3.Print();
+    //std::cout << std::endl;
 }
 
 void printByReference(const String& string) {
@@ -606,7 +607,21 @@ void lvaluesAndrvalues() {
     printString(hello + world);
 }
 
+void iterators() {
+    std::vector<int> values = {1,2,3,4,5};
+    
+    for (int value : values) {
+        std::cout << value << "\n";
+    }
+    
+    for (std::vector<int>::iterator it = values.begin(); it != values.end(); it++) {
+        std::cout << *it << "\n";
+    }
+}
 
+struct A {
+    int a = 1;
+};
 
 int main(int argc, char** argv) {
     references();
@@ -654,6 +669,8 @@ int main(int argc, char** argv) {
     moveSemantics();
     LINE_BREAK
     moveAssignment();
+    LINE_BREAK
+    iterators();
     LINE_BREAK
 }
 
